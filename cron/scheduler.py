@@ -1217,6 +1217,29 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     return value or None
 
 
+def _get_telegram_cron_reply_anchor(chat_id: str, thread_id: Optional[str]) -> Optional[str]:
+    """Return a Telegram reply anchor for private-DM topic cron delivery.
+
+    Telegram's visible DM "topics" on some clients are not reliably addressable
+    by ``message_thread_id`` or ``direct_messages_topic_id`` alone. Interactive
+    replies stay in the lane because they reply to that lane's anchor message.
+    For unattended cron sends, allow an explicit anchor in env so reports do not
+    drift back to the root/main DM.
+    """
+    if not thread_id:
+        return None
+    keys = [
+        f"TELEGRAM_CRON_REPLY_TO_MESSAGE_ID_{str(chat_id).replace('-', 'N')}_{thread_id}",
+        f"TELEGRAM_CRON_REPLY_TO_MESSAGE_ID_{thread_id}",
+        "TELEGRAM_CRON_REPLY_TO_MESSAGE_ID",
+    ]
+    for key in keys:
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return None
+
+
 def _iter_home_target_platforms():
     """Iterate built-in + plugin platform names that expose a home channel.
 
@@ -1925,7 +1948,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {"job_id": job["id"]}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
+                    if platform == Platform.TELEGRAM and looks_like_telegram_private_chat_id(str(chat_id)):
+                        reply_anchor = _get_telegram_cron_reply_anchor(str(chat_id), route_thread_id)
+                        if reply_anchor:
+                            route_metadata["telegram_reply_to_message_id"] = str(reply_anchor)
+                            route_metadata["telegram_dm_topic_reply_fallback"] = True
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+                if media_metadata and platform == Platform.TELEGRAM and looks_like_telegram_private_chat_id(str(chat_id)):
+                    reply_anchor = _get_telegram_cron_reply_anchor(str(chat_id), str(thread_id))
+                    if reply_anchor:
+                        media_metadata["telegram_reply_to_message_id"] = str(reply_anchor)
+                        media_metadata["telegram_dm_topic_reply_fallback"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.

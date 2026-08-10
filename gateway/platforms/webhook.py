@@ -382,6 +382,9 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "unipile_whatsapp":
+            return await self._deliver_unipile_whatsapp(content, delivery)
+
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
         _is_known_platform = deliver_type in _BUILTIN_DELIVER_PLATFORMS
@@ -1279,6 +1282,111 @@ class WebhookAdapter(BasePlatformAdapter):
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
         )
+
+    async def _deliver_unipile_whatsapp(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Send an agent response back to a WhatsApp chat through Unipile.
+
+        Local Miguel bridge use-case: a private poller filters a precise
+        WhatsApp conversation, posts the prompt to this local Hermes webhook,
+        and Hermes delivers the final answer back to the same Unipile chat.
+        """
+        import os
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        from pathlib import Path
+
+        extra = delivery.get("deliver_extra", {})
+        payload = delivery.get("payload", {})
+        chat_id = extra.get("chat_id") or payload.get("chat_id")
+        quote_id = extra.get("quote_id") or payload.get("message_id")
+        base_url = (
+            os.getenv("UNIPILE_BASE_URL_LUWAI")
+            or os.getenv("UNIPILE_BASE_URL")
+        )
+        api_key = (
+            os.getenv("UNIPILE_API_KEY_LUWAI")
+            or os.getenv("UNIPILE_API_KEY")
+        )
+        account_id = (
+            os.getenv("UNIPILE_ACCOUNT_ID_WHATSAPP_LUWAI")
+            or os.getenv("UNIPILE_ACCOUNT_ID_WHATSAPP")
+        )
+        if not (chat_id and base_url and api_key and account_id):
+            logger.error("[webhook] unipile_whatsapp missing chat/base/key/account")
+            return SendResult(success=False, error="Missing Unipile WhatsApp delivery config")
+        parsed_base = urllib.parse.urlsplit(str(base_url))
+        if parsed_base.scheme != "https" or not parsed_base.netloc:
+            logger.error("[webhook] unipile_whatsapp requires an HTTPS base URL")
+            return SendResult(success=False, error="Invalid Unipile base URL")
+
+        # Native WhatsApp media delivery: if the agent emits MEDIA:/path/to/file
+        # directives (e.g. image_generate returns a local PNG), strip the directive
+        # from visible text and upload the files as Unipile multipart attachments.
+        import mimetypes
+
+        media_files, cleaned_content = BasePlatformAdapter.extract_media(content)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        text_content = cleaned_content if media_files else content
+
+        boundary = "----hermes-unipile-" + str(int(time.time() * 1000))
+        fields = {
+            "account_id": account_id,
+            "typing_duration": "800",
+        }
+        # Unipile accepts text as a regular form field; for attachment-only
+        # replies, omit it rather than sending an empty/visible placeholder.
+        if str(text_content or "").strip():
+            fields["text"] = str(text_content).strip()
+        if quote_id:
+            fields["quote_id"] = str(quote_id)
+        parts: list[bytes] = []
+        for name, value in fields.items():
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            parts.append(str(value).encode("utf-8"))
+            parts.append(b"\r\n")
+        for media_path, _is_voice in media_files:
+            file_path = Path(media_path)
+            filename = file_path.name or "attachment"
+            mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(
+                (
+                    f'Content-Disposition: form-data; name="attachments"; '
+                    f'filename="{filename}"\r\n'
+                    f"Content-Type: {mime_type}\r\n\r\n"
+                ).encode()
+            )
+            parts.append(file_path.read_bytes())
+            parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        body = b"".join(parts)
+        url = f"{str(base_url).rstrip('/')}/api/v1/chats/{urllib.parse.quote(str(chat_id))}/messages"
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "X-API-KEY": str(api_key),
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                resp.read()
+            logger.info("[webhook] Delivered response via Unipile WhatsApp chat=%s chars=%d media=%d", chat_id, len(text_content or ""), len(media_files))
+            return SendResult(success=True)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            logger.error("[webhook] Unipile WhatsApp delivery failed HTTP %s: %s", exc.code, detail)
+            return SendResult(success=False, error=f"Unipile HTTP {exc.code}")
+        except Exception as exc:
+            logger.error("[webhook] Unipile WhatsApp delivery failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict
